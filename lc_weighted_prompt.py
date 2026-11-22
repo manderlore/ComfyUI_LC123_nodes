@@ -136,6 +136,69 @@ def _krea2_positions(clip, text: str, phrases: list, cond_len: int, ids: list) -
     return sorted(out.items())
 
 
+def _krea2_attn_forward(blk, offsets, strength, min_len, state):
+    """Replace attn.forward with a custom forward that reads weights from transformer_options.
+    Replaces (not wraps) to prevent patch accumulation across runs."""
+    import types
+    from einops import rearrange
+    from comfy.ldm.flux.math import apply_rope
+
+    def forward(self, x, freqs=None, mask=None, transformer_options=None):
+        if transformer_options is None:
+            transformer_options = {}
+        from comfy.ldm.modules.attention import optimized_attention, attention_pytorch
+
+        q, k, v, gate = self.wq(x), self.wk(x), self.wv(x), self.gate(x)
+        q = rearrange(q, "B L (H D) -> B H L D", H=self.heads)
+        k = rearrange(k, "B L (H D) -> B H L D", H=self.kvheads)
+        v = rearrange(v, "B L (H D) -> B H L D", H=self.kvheads)
+
+        weights = transformer_options.get("lc_krea2_token_weights")
+        bias = None
+        if weights:
+            sl = transformer_options.get("img_slice")
+            txt = int(sl[0]) if isinstance(sl, (list, tuple)) and sl else int(state.get("txtlen") or 0)
+            if txt >= min_len:
+                if not state.get("told"):
+                    state["told"] = True
+                    print(f"[LC Weighted Prompt] weights acting in the sampler (text length {txt})")
+                # Determine which batch rows are positive conditioning
+                batch = q.shape[0]
+                cu = transformer_options.get("cond_or_uncond") or [0]
+                per = max(1, batch // max(1, len(cu)))
+                rows = torch.tensor([cu[i // per] == 0 if i // per < len(cu) else True for i in range(batch)], device=q.device)
+                if bool(rows.any()):
+                    # Value scaling for weights < 1
+                    for d, w in weights:
+                        if w < 1.0:
+                            pos = txt - d
+                            if 0 <= pos < v.shape[2]:
+                                v = v.clone()
+                                v[rows, :, pos] = v[rows, :, pos] * (1.0 + strength * (w - 1.0))
+                    # Logit bias for weights > 1
+                    for d, w in weights:
+                        if w > 1.0:
+                            pos = txt - d
+                            if 0 <= pos < k.shape[2]:
+                                if bias is None:
+                                    bias = torch.zeros(batch, 1, 1, k.shape[2], device=q.device, dtype=q.dtype)
+                                bias[rows, 0, 0, pos] = EMPHASIS * strength * math.log(w)
+        q, k = self.qknorm(q, k)
+        if freqs is not None:
+            q, k = apply_rope(q, k, freqs)
+        if self.kvheads != self.heads:
+            rep = self.heads // self.kvheads
+            k = k.repeat_interleave(rep, dim=1)
+            v = v.repeat_interleave(rep, dim=1)
+        if bias is not None:
+            out = attention_pytorch(q, k, v, self.heads, mask=bias, skip_reshape=True)
+        else:
+            out = optimized_attention(q, k, v, self.heads, mask=mask, skip_reshape=True, transformer_options=transformer_options)
+        return self.wo(out * torch.sigmoid(gate))
+
+    return types.MethodType(forward, blk.attn)
+
+
 def _attn_patch(offsets: list, strength: float, min_len: int, state: dict):
     """Krea 2 block attn1_patch: logit bias on emphasised text keys, value scale on de-emphasised ones (cond rows only).
     offsets = [(tokens from the end of the text, weight)]; the text length comes from Krea 2's img_slice, or from
@@ -405,9 +468,16 @@ class LCWeightedPrompt:
                 state = {}
                 model = model.clone()
                 dm = model.get_model_object("diffusion_model")
-                patch = _attn_patch(offsets, strength, plain_len, state)
+                # Store weights in transformer_options (replaces previous weights on each clone)
+                to = model.model_options.get("transformer_options", {})
+                to["lc_krea2_token_weights"] = offsets
+                to["lc_krea2_strength"] = strength
+                to["lc_krea2_min_len"] = plain_len
+                model.model_options["transformer_options"] = to
+                # Replace (not wrap) attn.forward to prevent patch accumulation across runs
                 for i, blk in enumerate(dm.blocks):
-                    model.add_object_patch(f"diffusion_model.blocks.{i}.attn.forward", _block_forward(blk.attn.forward, i, patch))
+                    model.add_object_patch(f"diffusion_model.blocks.{i}.attn.forward",
+                                           _krea2_attn_forward(blk, offsets, strength, plain_len, state))
                 model.add_object_patch("diffusion_model.txtmlp.forward", _txt_probe(dm.txtmlp.forward, state))
                 print(f"[LC Weighted Prompt] Krea 2: {len(positions)} token(s) weighted: {shown} "
                       f"(placed from the end of the prompt, any encoder{', your edit' if use_edit else ''})")
